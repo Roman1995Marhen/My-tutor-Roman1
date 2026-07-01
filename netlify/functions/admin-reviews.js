@@ -3,30 +3,27 @@ const { getStore } = require("@netlify/blobs");
 
 const STORE_NAME = "code-tutor-reviews";
 const REVIEW_PREFIX = "review-";
-const APPROVED_INDEX_KEY = "approved-reviews";
-const MAX_REVIEWS = 1000;
-const ALLOWED_STATUSES = new Set(["pending", "approved", "hidden"]);
+const ADMIN_PASSWORD = process.env.REVIEWS_ADMIN_PASSWORD;
 
 function json(statusCode, payload) {
   return {
     statusCode,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store"
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, x-admin-password",
+      "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS"
     },
     body: JSON.stringify(payload)
   };
 }
 
 function parseBody(event) {
-  if (!event.body) {
-    return {};
-  }
-
+  if (!event.body) return {};
   const body = event.isBase64Encoded
     ? Buffer.from(event.body, "base64").toString("utf8")
     : event.body;
-
   try {
     return JSON.parse(body);
   } catch (error) {
@@ -34,38 +31,56 @@ function parseBody(event) {
   }
 }
 
-function getHeader(event, name) {
-  const headers = event.headers || {};
-  const key = Object.keys(headers).find((header) => header.toLowerCase() === name.toLowerCase());
-  return key ? headers[key] : "";
-}
-
-function safeEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-
-  if (left.length !== right.length) {
+function checkAuth(event) {
+  const password = event.headers["x-admin-password"] || 
+                   event.headers["X-Admin-Password"];
+  
+  if (!ADMIN_PASSWORD) {
+    console.error("REVIEWS_ADMIN_PASSWORD environment variable is not set");
     return false;
   }
-
-  return crypto.timingSafeEqual(left, right);
+  
+  return password === ADMIN_PASSWORD;
 }
 
-function isAuthorized(event) {
-  const expectedPassword = process.env.REVIEWS_ADMIN_PASSWORD;
-  const receivedPassword = getHeader(event, "x-admin-password");
+function cleanText(value, maxLength) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
 
-  return Boolean(expectedPassword && receivedPassword && safeEqual(receivedPassword, expectedPassword));
+function normalizeReview(input) {
+  const name = cleanText(input.name, 80);
+  const course = cleanText(input.course, 140);
+  const comment = cleanText(input.comment, 1000);
+  const rating = Number(input.rating);
+
+  if (name.length < 2) {
+    return { error: "Укажите имя минимум из 2 символов." };
+  }
+
+  if (!course) {
+    return { error: "Выберите проект обучения." };
+  }
+
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return { error: "Выберите оценку от 1 до 5." };
+  }
+
+  if (comment.length < 10) {
+    return { error: "Напишите комментарий минимум из 10 символов." };
+  }
+
+  return { name, course, rating, comment };
 }
 
 async function listAllReviews(store) {
   const reviews = [];
   let cursor;
-
   do {
     const page = await store.list({ prefix: REVIEW_PREFIX, cursor });
     const blobs = page.blobs || [];
-
     const pageReviews = await Promise.all(
       blobs.map(async (blob) => {
         try {
@@ -75,95 +90,114 @@ async function listAllReviews(store) {
         }
       })
     );
-
     reviews.push(...pageReviews.filter(Boolean));
     cursor = page.cursor;
   } while (cursor);
-
   return reviews.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
-function toPublicReview(review) {
-  return {
-    id: review.id,
-    name: review.name,
-    course: review.course,
-    rating: review.rating,
-    comment: review.comment,
-    createdAt: review.createdAt
-  };
-}
-
-async function rebuildApprovedIndex(store) {
-  const reviews = await listAllReviews(store);
-  const approvedReviews = reviews
-    .filter((review) => review.status === "approved")
-    .slice(0, MAX_REVIEWS)
-    .map(toPublicReview);
-
-  await store.setJSON(APPROVED_INDEX_KEY, approvedReviews);
-}
-
 exports.handler = async function (event) {
+  // OPTIONS для CORS
   if (event.httpMethod === "OPTIONS") {
     return json(204, {});
   }
 
-  if (!process.env.REVIEWS_ADMIN_PASSWORD) {
-    return json(500, { error: "Не задана переменная REVIEWS_ADMIN_PASSWORD в Netlify." });
+  // POST - добавить новый отзыв (публичный, без пароля)
+  if (event.httpMethod === "POST") {
+    const body = parseBody(event);
+    if (!body) {
+      return json(400, { error: "Некорректные данные формы." });
+    }
+
+    if (body.botField || body["bot-field"]) {
+      return json(200, { ok: true });
+    }
+
+    const normalized = normalizeReview(body);
+    if (normalized.error) {
+      return json(400, { error: normalized.error });
+    }
+
+    const existingReviews = await listAllReviews(store);
+    if (existingReviews.length >= 1000) {
+      return json(409, { error: "Достигнут лимит в 1000 отзывов." });
+    }
+
+    const id = `${REVIEW_PREFIX}${Date.now()}-${crypto.randomUUID()}`;
+    const review = {
+      id,
+      name: normalized.name,
+      course: normalized.course,
+      rating: normalized.rating,
+      comment: normalized.comment,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    await store.setJSON(id, review);
+    return json(201, {
+      ok: true,
+      message: "Отзыв отправлен на модерацию."
+    });
   }
 
-  if (!isAuthorized(event)) {
+  // Для всех остальных методов (GET, PATCH, DELETE) - проверяем пароль
+  if (!checkAuth(event)) {
     return json(401, { error: "Неверный пароль администратора." });
   }
 
   const store = getStore(STORE_NAME);
 
+  // GET - получить все отзывы (для админки)
   if (event.httpMethod === "GET") {
-    const reviews = await listAllReviews(store);
-    return json(200, { reviews });
+    try {
+      const allReviews = await listAllReviews(store);
+      return json(200, { reviews: allReviews });
+    } catch (error) {
+      console.error("Error loading reviews:", error);
+      return json(500, { error: "Не удалось загрузить отзывы." });
+    }
   }
 
-  const body = parseBody(event);
-  if (!body) {
-    return json(400, { error: "Некорректные данные." });
-  }
-
-  const id = String(body.id || "");
-  if (!id.startsWith(REVIEW_PREFIX)) {
-    return json(400, { error: "Некорректный id отзыва." });
-  }
-
-  const review = await store.get(id, { type: "json" });
-  if (!review) {
-    return json(404, { error: "Отзыв не найден." });
-  }
-
+  // PATCH - изменить статус отзыва
   if (event.httpMethod === "PATCH") {
-    const status = String(body.status || "");
-    if (!ALLOWED_STATUSES.has(status)) {
-      return json(400, { error: "Некорректный статус отзыва." });
+    try {
+      const body = parseBody(event);
+      if (!body || !body.id || !body.status) {
+        return json(400, { error: "Не указан ID или статус." });
+      }
+
+      const reviewData = await store.get(body.id, { type: "json" });
+      if (!reviewData) {
+        return json(404, { error: "Отзыв не найден." });
+      }
+
+      reviewData.status = body.status;
+      reviewData.updatedAt = new Date().toISOString();
+      await store.setJSON(body.id, reviewData);
+
+      return json(200, { success: true, review: reviewData });
+    } catch (error) {
+      console.error("Error updating review:", error);
+      return json(500, { error: "Не удалось обновить отзыв." });
     }
-
-    const updatedReview = {
-      ...review,
-      status,
-      updatedAt: new Date().toISOString()
-    };
-
-    if (status === "approved" && !updatedReview.approvedAt) {
-      updatedReview.approvedAt = new Date().toISOString();
-    }
-
-    await store.setJSON(id, updatedReview);
-    await rebuildApprovedIndex(store);
-    return json(200, { ok: true, review: updatedReview });
   }
 
+  // DELETE - удалить отзыв
   if (event.httpMethod === "DELETE") {
-    await store.delete(id);
-    await rebuildApprovedIndex(store);
-    return json(200, { ok: true });
+    try {
+      const body = parseBody(event);
+      if (!body || !body.id) {
+        return json(400, { error: "Не указан ID отзыва." });
+      }
+
+      await store.delete(body.id);
+      return json(200, { success: true });
+    } catch (error) {
+      console.error("Error deleting review:", error);
+      return json(500, { error: "Не удалось удалить отзыв." });
+    }
   }
 
   return json(405, { error: "Метод не поддерживается." });
